@@ -20,23 +20,44 @@ jobs:
           sudo apt-get clean
           df -h /
 
+      - name: Restore build cache
+        id: cache-restore
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/fuzzilli-build
+          key: fuzzilli-jsc-${{ runner.os }}-${{ hashFiles('Cloud/Docker/JSCBuilder/Dockerfile', 'Cloud/Docker/FuzzilliBuilder/Dockerfile', 'Cloud/Docker/build.sh', 'Targets/JavaScriptCore/REVISION') }}
+          restore-keys: |
+            fuzzilli-jsc-${{ runner.os }}-
+
+      - name: Restore cached Docker image
+        id: image-restore
+        run: |
+          set -euo pipefail
+          CACHE_DIR="$HOME/.cache/fuzzilli-build"
+          mkdir -p "$CACHE_DIR"
+          if [ -f "$CACHE_DIR/jsc_builder.tar" ]; then
+            echo "Loading cached jsc_builder image..."
+            docker load -i "$CACHE_DIR/jsc_builder.tar"
+            echo "IMAGE_LOADED=true" >> "$GITHUB_ENV"
+          else
+            echo "IMAGE_LOADED=false" >> "$GITHUB_ENV"
+          fi
+
       - name: Patch Dockerfiles
         run: |
           set -euo pipefail
 
-          # 1) Bỏ swift test, chỉ build release (test WasmWideArithmeticsTests bị hỏng)
           FB=Cloud/Docker/FuzzilliBuilder/Dockerfile
           if [ -f "$FB" ]; then
             sed -i 's/swift test && swift build -c release/swift build -c release/' "$FB"
           fi
 
-          # 2) libicu reinstall cần -y trong môi trường không tương tác
           JB=Cloud/Docker/JSCBuilder/Dockerfile
           if [ -f "$JB" ]; then
             sed -i 's/apt-get reinstall libicu-dev/apt-get reinstall -y libicu-dev/' "$JB"
           fi
 
-          # 3) Chèn ENV DEBIAN_FRONTEND SAU dòng FROM (không phải trước)
           for f in Cloud/Docker/*/Dockerfile Cloud/Docker/Dockerfile; do
             [ -f "$f" ] || continue
             if grep -q '^FROM' "$f" && ! grep -q 'DEBIAN_FRONTEND' "$f"; then
@@ -45,42 +66,84 @@ jobs:
           done
 
           echo "---- Kiểm tra patch ----"
-          echo "== FuzzilliBuilder =="
           head -n 8 "$FB" 2>/dev/null || true
           grep -n 'swift' "$FB" 2>/dev/null || true
-          echo "== JSCBuilder =="
           head -n 12 "$JB" 2>/dev/null || true
           grep -n 'libicu' "$JB" 2>/dev/null || true
 
       - name: Build Fuzzilli Docker image (JSC target)
+        if: env.IMAGE_LOADED != 'true'
         run: |
           cd Cloud/Docker
           ./build.sh jsc
+
+      - name: Save image to cache (always)
+        if: always()
+        run: |
+          set -euo pipefail
+          CACHE_DIR="$HOME/.cache/fuzzilli-build"
+          mkdir -p "$CACHE_DIR"
+          IMAGE=jsc_builder:latest
+          if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "Saving image to cache..."
+            docker save -o "$CACHE_DIR/jsc_builder.tar" "$IMAGE"
+            ls -lah "$CACHE_DIR/jsc_builder.tar"
+          else
+            echo "Image $IMAGE không tồn tại, bỏ qua save."
+          fi
+
+      - name: Locate binaries inside image
+        id: locate
+        run: |
+          set -euo pipefail
+          IMAGE=jsc_builder:latest
+          docker image inspect "$IMAGE" >/dev/null 2>&1 || IMAGE=fuzzilli
+
+          echo "Dùng image: $IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+          echo "==== Tìm jsc ===="
+          docker run --rm "$IMAGE" find /home/builder -type f -name 'jsc' 2>/dev/null | tee /tmp/jsc_paths.txt || true
+          echo "==== Tìm Fuzzilli ===="
+          docker run --rm "$IMAGE" find /home/builder -type f -name 'Fuzzilli' 2>/dev/null | tee /tmp/fuzzilli_paths.txt || true
+
+          JSC_PATH=$(head -n 1 /tmp/jsc_paths.txt || true)
+          FUZZ_PATH=$(head -n 1 /tmp/fuzzilli_paths.txt || true)
+
+          if [ -z "$JSC_PATH" ]; then
+            echo "ERROR: không tìm thấy jsc trong image"
+            exit 1
+          fi
+          if [ -z "$FUZZ_PATH" ]; then
+            echo "ERROR: không tìm thấy Fuzzilli trong image"
+            exit 1
+          fi
+
+          echo "JSC_PATH=$JSC_PATH" >> "$GITHUB_ENV"
+          echo "FUZZ_PATH=$FUZZ_PATH" >> "$GITHUB_ENV"
+          echo "jsc: $JSC_PATH"
+          echo "Fuzzilli: $FUZZ_PATH"
 
       - name: Extract jsc, FuzzilliCli, and linked libraries
         run: |
           set -euo pipefail
           mkdir -p out/lib out/lib/swift
 
-          CONTAINER_ID=$(docker create fuzzilli)
+          CONTAINER_ID=$(docker create "$IMAGE")
           trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
 
-          # 1) Copy binary chính
-          docker cp "$CONTAINER_ID":/home/builder/Fuzzilli ./out/FuzzilliCli
-          docker cp "$CONTAINER_ID":/home/builder/jsc/jsc ./out/jsc
-          chmod +x ./out/FuzzilliCli ./out/jsc
+          docker cp "$CONTAINER_ID":"$JSC_PATH" ./out/jsc
+          docker cp "$CONTAINER_ID":"$FUZZ_PATH" ./out/FuzzilliCli
+          chmod +x ./out/jsc ./out/FuzzilliCli
 
-          # 2) Thu thập thư viện động cho CẢ HAI binary
-          for bin in /home/builder/jsc/jsc /home/builder/Fuzzilli; do
+          for bin in "$JSC_PATH" "$FUZZ_PATH"; do
             echo "==== ldd cho $bin ===="
-            LIBS=$(docker run --rm fuzzilli ldd "$bin" 2>/dev/null \
+            LIBS=$(docker run --rm "$IMAGE" ldd "$bin" 2>/dev/null \
                     | awk '/=>/ && $3 ~ /^\// {print $3}' || true)
-
             if [ -z "$LIBS" ]; then
               echo "Không phát hiện thư viện động ngoài cho $bin."
               continue
             fi
-
             for lib in $LIBS; do
               case "$lib" in
                 /lib/x86_64-linux-gnu/*|/lib64/*|/usr/lib/x86_64-linux-gnu/libc.so*|/usr/lib/x86_64-linux-gnu/libm.so*|/usr/lib/x86_64-linux-gnu/libpthread.so*|/usr/lib/x86_64-linux-gnu/libdl.so*|/usr/lib/x86_64-linux-gnu/librt.so*)
@@ -90,24 +153,22 @@ jobs:
               esac
               dest="out/lib/$(basename "$lib")"
               if [ ! -f "$dest" ]; then
-                docker cp "$CONTAINER_ID":"$lib" "$dest"
+                docker cp "$CONTAINER_ID":"$lib" "$dest" 2>/dev/null || true
                 echo "Đã copy $lib -> $dest"
               fi
             done
           done
 
-          # 3) Copy toàn bộ Swift runtime + dispatch + Foundation nếu có
-          SWIFT_LIBS=$(docker run --rm fuzzilli ldd /home/builder/Fuzzilli 2>/dev/null \
+          SWIFT_LIBS=$(docker run --rm "$IMAGE" ldd "$FUZZ_PATH" 2>/dev/null \
                         | awk '/libswift|libdispatch|libFoundation|libBlocksRuntime/ && $3 ~ /^\// {print $3}' || true)
           for lib in $SWIFT_LIBS; do
             dest="out/lib/swift/$(basename "$lib")"
             if [ ! -f "$dest" ]; then
-              docker cp "$CONTAINER_ID":"$lib" "$dest"
+              docker cp "$CONTAINER_ID":"$lib" "$dest" 2>/dev/null || true
               echo "Đã copy Swift lib $lib -> $dest"
             fi
           done
 
-          # 4) Copy thêm thư mục /usr/lib/swift/linux nếu tồn tại (phòng trường hợp ldd không bắt hết)
           docker cp "$CONTAINER_ID":/usr/lib/swift/linux ./out/lib/swift-linux 2>/dev/null || true
 
           echo "---- Nội dung out/ ----"
@@ -118,15 +179,17 @@ jobs:
           echo "==== REPRL check ===="
           strings ./out/jsc | grep -i -E 'fuzzilli|reprl' | head -n 20 \
             || echo "WARN: no reprl symbols found"
-          echo "==== ldd trên máy runner ===="
+          echo "==== ldd trên runner ===="
           LD_LIBRARY_PATH="$PWD/out/lib:$PWD/out/lib/swift:$PWD/out/lib/swift-linux" \
             ldd ./out/jsc | head -n 30 || true
           LD_LIBRARY_PATH="$PWD/out/lib:$PWD/out/lib/swift:$PWD/out/lib/swift-linux" \
             ldd ./out/FuzzilliCli | head -n 30 || true
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jsc-fuzzilli-binaries
           path: out/
           retention-days: 30
+          if-no-files-found: warn
