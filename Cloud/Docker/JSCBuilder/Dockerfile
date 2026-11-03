@@ -12,7 +12,7 @@ RUN apt-get reinstall libicu-dev
 RUN useradd -m builder
 
 # Fetch WebKit source code
-RUN git clone https://github.com/WebKit/WebKit.git /home/builder/webkit
+RUN git clone --depth 1 https://github.com/WebKit/WebKit.git /home/builder/webkit
 WORKDIR /home/builder/webkit
 
 # Docker will attempt to cache the output of every step. That's fine (and useful to speed things up, e.g. by avoiding
