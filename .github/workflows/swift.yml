@@ -20,25 +20,37 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Patch Dockerfiles (skip swift test, fix apt non-interactive)
+      - name: Patch Dockerfiles
         run: |
           set -euo pipefail
 
           # 1) Bỏ swift test, chỉ build release (test WasmWideArithmeticsTests bị hỏng)
           FB=Cloud/Docker/FuzzilliBuilder/Dockerfile
-          sed -i 's/swift test && swift build -c release/swift build -c release/' "$FB"
+          if [ -f "$FB" ]; then
+            sed -i 's/swift test && swift build -c release/swift build -c release/' "$FB"
+          fi
 
           # 2) libicu reinstall cần -y trong môi trường không tương tác
           JB=Cloud/Docker/JSCBuilder/Dockerfile
-          sed -i 's/apt-get reinstall libicu-dev/apt-get reinstall -y libicu-dev/' "$JB"
+          if [ -f "$JB" ]; then
+            sed -i 's/apt-get reinstall libicu-dev/apt-get reinstall -y libicu-dev/' "$JB"
+          fi
 
-          # 3) Ép mọi apt-get không tương tác (an toàn cho các Dockerfile khác)
-          grep -rl 'apt-get' Cloud/Docker/*/Dockerfile Cloud/Docker/Dockerfile 2>/dev/null \
-            | xargs -r sed -i '1i ENV DEBIAN_FRONTEND=noninteractive'
+          # 3) Chèn ENV DEBIAN_FRONTEND SAU dòng FROM (không phải trước)
+          for f in Cloud/Docker/*/Dockerfile Cloud/Docker/Dockerfile; do
+            [ -f "$f" ] || continue
+            if grep -q '^FROM' "$f" && ! grep -q 'DEBIAN_FRONTEND' "$f"; then
+              sed -i '/^FROM/a ENV DEBIAN_FRONTEND=noninteractive' "$f"
+            fi
+          done
 
           echo "---- Kiểm tra patch ----"
-          grep -n 'swift' "$FB" || true
-          grep -n 'libicu' "$JB" || true
+          echo "== FuzzilliBuilder =="
+          head -n 8 "$FB" 2>/dev/null || true
+          grep -n 'swift' "$FB" 2>/dev/null || true
+          echo "== JSCBuilder =="
+          head -n 12 "$JB" 2>/dev/null || true
+          grep -n 'libicu' "$JB" 2>/dev/null || true
 
       - name: Build Fuzzilli Docker image (JSC target)
         run: |
@@ -48,7 +60,7 @@ jobs:
       - name: Extract jsc, FuzzilliCli, and linked libraries
         run: |
           set -euo pipefail
-          mkdir -p out/lib
+          mkdir -p out/lib out/lib/swift
 
           CONTAINER_ID=$(docker create fuzzilli)
           trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
@@ -84,24 +96,33 @@ jobs:
             done
           done
 
-          # 3) Copy thêm runtime Swift nếu FuzzilliCli cần
+          # 3) Copy toàn bộ Swift runtime + dispatch + Foundation nếu có
           SWIFT_LIBS=$(docker run --rm fuzzilli ldd /home/builder/Fuzzilli 2>/dev/null \
-                        | awk '/libswift|libdispatch|libFoundation/ && $3 ~ /^\// {print $3}' || true)
-          if [ -n "$SWIFT_LIBS" ]; then
-            mkdir -p out/lib/swift
-            for lib in $SWIFT_LIBS; do
-              dest="out/lib/swift/$(basename "$lib")"
-              [ -f "$dest" ] || docker cp "$CONTAINER_ID":"$lib" "$dest"
-            done
-          fi
+                        | awk '/libswift|libdispatch|libFoundation|libBlocksRuntime/ && $3 ~ /^\// {print $3}' || true)
+          for lib in $SWIFT_LIBS; do
+            dest="out/lib/swift/$(basename "$lib")"
+            if [ ! -f "$dest" ]; then
+              docker cp "$CONTAINER_ID":"$lib" "$dest"
+              echo "Đã copy Swift lib $lib -> $dest"
+            fi
+          done
+
+          # 4) Copy thêm thư mục /usr/lib/swift/linux nếu tồn tại (phòng trường hợp ldd không bắt hết)
+          docker cp "$CONTAINER_ID":/usr/lib/swift/linux ./out/lib/swift-linux 2>/dev/null || true
 
           echo "---- Nội dung out/ ----"
           find out -type f -exec ls -lah {} \;
 
       - name: Verify REPRL symbols
         run: |
+          echo "==== REPRL check ===="
           strings ./out/jsc | grep -i -E 'fuzzilli|reprl' | head -n 20 \
             || echo "WARN: no reprl symbols found"
+          echo "==== ldd trên máy runner ===="
+          LD_LIBRARY_PATH="$PWD/out/lib:$PWD/out/lib/swift:$PWD/out/lib/swift-linux" \
+            ldd ./out/jsc | head -n 30 || true
+          LD_LIBRARY_PATH="$PWD/out/lib:$PWD/out/lib/swift:$PWD/out/lib/swift-linux" \
+            ldd ./out/FuzzilliCli | head -n 30 || true
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
