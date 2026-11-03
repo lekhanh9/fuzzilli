@@ -1,14 +1,17 @@
-name: Build JSC + Fuzzilli (Blacksmith)
+name: Build JSC + Fuzzilli
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # Cấu hình 4-core 
+    runs-on: ubuntu-latest-4-cores
     timeout-minutes: 360
 
     steps:
@@ -17,7 +20,7 @@ jobs:
 
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo apt-get clean
           df -h /
 
@@ -37,21 +40,17 @@ jobs:
             fi
           done
 
-      - name: Set up Blacksmith Docker Builder
-        uses: useblacksmith/setup-docker-builder@v2
-        with:
-          cache-key: jsc-webkit-builder
-
-      - name: Build JSC Image
+      - name: Build Fuzzilli Docker image (JSC target)
         run: |
           cd Cloud/Docker
-          docker build -t jsc_builder -f JSCBuilder/Dockerfile .
+          ./build.sh jsc
 
       - name: Locate and Extract Binaries
         run: |
           set -euo pipefail
           mkdir -p out/lib out/lib/swift
           
+          # 1. Tìm file jsc
           if [ -f "Cloud/Docker/out/jsc" ]; then
               echo "Tìm thấy jsc từ build.sh."
               cp "Cloud/Docker/out/jsc" ./out/jsc
@@ -70,10 +69,21 @@ jobs:
           fi
           chmod +x ./out/jsc
           
+          # 2. Tìm FuzzilliCli
           if [ -f "fuzzilli/.build/release/FuzzilliCli" ]; then
               cp "fuzzilli/.build/release/FuzzilliCli" ./out/FuzzilliCli
+          else
+              IMAGE_FUZZ=fuzzilli
+              FUZZ_PATH=$(docker run --rm "$IMAGE_FUZZ" find /home/builder -type f -name 'Fuzzilli' 2>/dev/null | head -n 1 || true)
+              if [ -n "$FUZZ_PATH" ]; then
+                  CONTAINER_ID=$(docker create "$IMAGE_FUZZ")
+                  docker cp "$CONTAINER_ID":"$FUZZ_PATH" ./out/FuzzilliCli
+                  docker rm "$CONTAINER_ID"
+              fi
           fi
+          [ -f "./out/FuzzilliCli" ] && chmod +x ./out/FuzzilliCli
 
+          # 3. Copy thư viện
           IMAGE_LIB=jsc_builder:latest
           CONTAINER_ID=$(docker create "$IMAGE_LIB")
           trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
