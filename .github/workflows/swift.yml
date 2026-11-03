@@ -1,16 +1,14 @@
-name: Build JSC + Fuzzilli
+name: Build JSC + Fuzzilli (Blacksmith)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: ubuntu-latest-8-cores
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 360
 
     steps:
@@ -19,7 +17,7 @@ jobs:
 
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get clean
           df -h /
 
@@ -39,21 +37,25 @@ jobs:
             fi
           done
 
+      - name: Set up Blacksmith Docker Builder
+        uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: jsc-webkit-builder
+
       - name: Build JSC Image
         run: |
           cd Cloud/Docker
-          ./build.sh jsc
+          docker build -t jsc_builder -f JSCBuilder/Dockerfile .
 
       - name: Locate and Extract Binaries
         run: |
           set -euo pipefail
           mkdir -p out/lib out/lib/swift
           
-          # 1. Tìm file jsc (Ưu tiên lấy từ thư mục out của build.sh, nếu không có mới mò vào image)
           if [ -f "Cloud/Docker/out/jsc" ]; then
               echo "Tìm thấy jsc từ build.sh."
               cp "Cloud/Docker/out/jsc" ./out/jsc
-              JSC_PATH="/home/builder/webkit/WebKitBuild/Release/bin/jsc" # Dùng path này để lấy libs
+              JSC_PATH="/home/builder/webkit/WebKitBuild/Release/bin/jsc"
           else
               echo "Không thấy Cloud/Docker/out/jsc, tìm trong Docker image..."
               IMAGE=jsc_builder:latest
@@ -68,30 +70,14 @@ jobs:
           fi
           chmod +x ./out/jsc
           
-          # 2. Tìm FuzzilliCli
-          # Thử lấy FuzzilliCli từ thư mục build local của repo trước
           if [ -f "fuzzilli/.build/release/FuzzilliCli" ]; then
               cp "fuzzilli/.build/release/FuzzilliCli" ./out/FuzzilliCli
-          else
-              # Nếu không có, lấy từ image fuzzilli (nếu có build)
-              IMAGE_FUZZ=fuzzilli
-              FUZZ_PATH=$(docker run --rm "$IMAGE_FUZZ" find /home/builder -type f -name 'Fuzzilli' 2>/dev/null | head -n 1 || true)
-              if [ -z "$FUZZ_PATH" ]; then
-                  echo "ERROR: Không tìm thấy FuzzilliCli!"
-                  exit 1
-              fi
-              CONTAINER_ID=$(docker create "$IMAGE_FUZZ")
-              docker cp "$CONTAINER_ID":"$FUZZ_PATH" ./out/FuzzilliCli
-              docker rm "$CONTAINER_ID"
           fi
-          chmod +x ./out/FuzzilliCli
 
-          # 3. Copy thư viện (Dùng image jsc_builder đã build xong)
           IMAGE_LIB=jsc_builder:latest
           CONTAINER_ID=$(docker create "$IMAGE_LIB")
           trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
 
-          # Copy libs cho jsc
           LIBS=$(docker run --rm "$IMAGE_LIB" ldd "$JSC_PATH" 2>/dev/null | awk '/=>/ && $3 ~ /^\// {print $3}' || true)
           for lib in $LIBS; do
             case "$lib" in
@@ -101,9 +87,7 @@ jobs:
             [ -f "$dest" ] || docker cp "$CONTAINER_ID":"$lib" "$dest" 2>/dev/null || true
           done
 
-          # Copy libs cho Fuzzilli (Swift runtime)
           if [ -f "fuzzilli/.build/release/FuzzilliCli" ]; then
-            # Nếu build local trên runner, libs nằm trong /usr/lib/swift/linux
             mkdir -p ./out/lib/swift-linux
             sudo cp -a /usr/lib/swift/linux/* ./out/lib/swift-linux/ 2>/dev/null || true
           fi
