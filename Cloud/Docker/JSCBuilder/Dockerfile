@@ -5,14 +5,19 @@ ENV SHELL=bash
 
 RUN apt-get -y update && apt-get -y upgrade
 RUN apt-get install -y git cmake ninja-build clang ruby python3-dev
+
 # The swift image has a modified libicu in /usr/include/unicode which sets a custom U_LIB_SUFFIX_C_NAME (to "_swift"),
 # causing build failures in JSC. Reinstall libicu-dev to fix that.
-RUN apt-get reinstall libicu-dev
+# Đã thêm -y để không bị kẹt ở prompt Y/n
+RUN apt-get reinstall -y libicu-dev
 
 RUN useradd -m builder
 
 # Fetch WebKit source code
-RUN git clone --depth 1 https://github.com/WebKit/WebKit.git /home/builder/webkit
+# Dùng --filter=blob:none thay vì --depth 1. 
+# Nó tải toàn bộ lịch sử commit (để checkout $rev không bị lỗi), nhưng KHÔNG tải nội dung file 
+# cho đến khi cần, giúp tiết kiệm cực nhiều dung lượng và thời gian so với clone thường.
+RUN git clone --filter=blob:none https://github.com/WebKit/WebKit.git /home/builder/webkit
 WORKDIR /home/builder/webkit
 
 # Docker will attempt to cache the output of every step. That's fine (and useful to speed things up, e.g. by avoiding
@@ -26,7 +31,8 @@ ARG rev=master
 RUN apt-get -y update && apt-get -y upgrade
 
 # Fetch latest source code and checkout requested source revision
-RUN git pull
+# --filter=blob:none sẽ tự động tải các file cần thiết khi git checkout
+RUN git fetch --all
 RUN git checkout $rev
 
 # Upload and apply patches
