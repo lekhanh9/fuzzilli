@@ -1,4 +1,4 @@
-name: Build JSC + Fuzzilli (Ubuntu 24.04)
+name: Build JSC + Fuzzilli (Ubuntu 24.04 Noble)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   build:
-    # Chạy trên đúng bản Ubuntu 24.04 để khớp với Codespace
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -24,20 +23,24 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Patch Dockerfiles
+      - name: Patch Build Scripts and Dockerfiles
         run: |
           set -euo pipefail
-          # 1. Ép dùng Swift 6.0 bản Noble (Ubuntu 24.04) để tương thích GLIBC
-          sed -i 's/FROM swift:latest/FROM swift:6.0-noble/' Cloud/Docker/JSCBuilder/Dockerfile
-          sed -i 's/FROM swift:latest/FROM swift:6.0-noble/' Cloud/Docker/FuzzilliBuilder/Dockerfile
-
-          # 2. Fix lỗi apt-get reinstall bị kẹt Y/n
+          
+          # 1. Patch build.sh để tự động tìm file jsc thay vì dùng đường dẫn cũ FuzzBuild/Debug
+          sed -i 's|docker cp temp_container:/home/builder/webkit/FuzzBuild/Debug/bin/jsc out/jsc|JSC_PATH=$(docker run --rm jsc_builder find /home/builder/webkit -type f -name "jsc" 2>/dev/null \| head -n 1 \|\| true); docker cp temp_container:$JSC_PATH out/jsc \|\| true|' Cloud/Docker/build.sh
+          
+          # 2. Đổi base image sang swift:noble (Swift mới nhất + Ubuntu 24.04)
+          sed -i 's/FROM swift:.*/FROM swift:noble/' Cloud/Docker/JSCBuilder/Dockerfile
+          sed -i 's/FROM swift:.*/FROM swift:noble/' Cloud/Docker/FuzzilliBuilder/Dockerfile
+          
+          # 3. Fix lỗi apt-get reinstall
           sed -i 's/apt-get reinstall libicu-dev/apt-get reinstall -y libicu-dev/' Cloud/Docker/JSCBuilder/Dockerfile
           
-          # 3. Bỏ swift test (vì nó hay bị fail do test suite của Fuzzilli)
+          # 4. Bỏ swift test
           sed -i 's/swift test && swift build -c release/swift build -c release/' Cloud/Docker/FuzzilliBuilder/Dockerfile
-
-          # 4. Thêm ENV non-interactive cho tất cả Dockerfile
+          
+          # 5. Thêm ENV non-interactive
           for f in Cloud/Docker/*/Dockerfile Cloud/Docker/Dockerfile; do
             [ -f "$f" ] || continue
             if grep -q '^FROM' "$f" && ! grep -q 'DEBIAN_FRONTEND' "$f"; then
@@ -50,40 +53,49 @@ jobs:
           cd Cloud/Docker
           ./build.sh jsc
 
-      - name: Build FuzzilliCli natively
+      - name: Build FuzzilliCli
         run: |
           set -euo pipefail
-          mkdir -p out/lib out/lib/swift
-          # Build FuzzilliCli bằng Docker image swift:6.0-noble
-          docker run --rm -v "$PWD:/src" -w /src swift:6.0-noble \
+          # Build FuzzilliCli bằng image swift:noble
+          docker run --rm -v "$PWD:/src" -w /src swift:noble \
             bash -c "apt-get update && apt-get install -y libcurl4-openssl-dev libxml2-dev && swift build -c release"
           
+          mkdir -p out
           cp .build/release/FuzzilliCli ./out/FuzzilliCli
           chmod +x ./out/FuzzilliCli
 
       - name: Extract JSC and Libraries
         run: |
           set -euo pipefail
+          mkdir -p out/lib out/lib/swift
           
-          # 1. Lấy jsc từ build.sh
-          cp Cloud/Docker/out/jsc ./out/jsc
+          # 1. Copy jsc từ thư mục out của build.sh
+          if [ -f "Cloud/Docker/out/jsc" ]; then
+              cp "Cloud/Docker/out/jsc" ./out/jsc
+          else
+              # Dự phòng nếu build.sh không copy được
+              docker create --name temp_jsc jsc_builder:latest
+              JSC_PATH=$(docker run --rm jsc_builder:latest find /home/builder/webkit -type f -name 'jsc' 2>/dev/null | head -n 1 || true)
+              docker cp temp_jsc:"$JSC_PATH" ./out/jsc
+              docker rm temp_jsc
+          fi
           chmod +x ./out/jsc
 
-          # 2. Tạo container từ image jsc_builder để lấy thư viện ICU
-          IMAGE=jsc_builder:latest
-          docker create --name temp_jsc "$IMAGE"
-          
-          # Copy các thư viện ICU chuẩn (bản 74 của Ubuntu 24.04)
+          # 2. Copy thư viện ICU 74 (bản của Ubuntu 24.04) và libatomic
+          docker create --name temp_jsc jsc_builder:latest
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicuuc.so.74 ./out/lib/ 2>/dev/null || true
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicudata.so.74 ./out/lib/ 2>/dev/null || true
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicui18n.so.74 ./out/lib/ 2>/dev/null || true
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libatomic.so.1 ./out/lib/ 2>/dev/null || true
-          
-          # Copy toàn bộ Swift runtime (để FuzzilliCli chạy được)
-          docker create --name temp_swift swift:6.0-noble
+          docker rm temp_jsc
+
+          # 3. Copy Swift runtime cho FuzzilliCli
+          docker create --name temp_swift swift:noble
           docker cp temp_swift:/usr/lib/swift/linux ./out/lib/swift-linux
-          
-          docker rm -f temp_jsc temp_swift
+          docker rm temp_swift
+
+          echo "---- Nội dung out/ ----"
+          ls -lah out/ out/lib/
 
       - name: Zip Output
         run: |
