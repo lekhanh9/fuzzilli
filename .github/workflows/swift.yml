@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,30 +22,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo apt-get clean
           df -h /
-
-      - name: Restore build cache
-        id: cache-restore
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/fuzzilli-build
-          key: fuzzilli-jsc-${{ runner.os }}-${{ hashFiles('Cloud/Docker/JSCBuilder/Dockerfile', 'Cloud/Docker/FuzzilliBuilder/Dockerfile', 'Cloud/Docker/build.sh', 'Targets/JavaScriptCore/REVISION') }}
-          restore-keys: |
-            fuzzilli-jsc-${{ runner.os }}-
-
-      - name: Restore cached Docker image
-        id: image-restore
-        run: |
-          set -euo pipefail
-          CACHE_DIR="$HOME/.cache/fuzzilli-build"
-          mkdir -p "$CACHE_DIR"
-          if [ -f "$CACHE_DIR/jsc_builder.tar" ]; then
-            echo "Loading cached jsc_builder image..."
-            docker load -i "$CACHE_DIR/jsc_builder.tar"
-            echo "IMAGE_LOADED=true" >> "$GITHUB_ENV"
-          else
-            echo "IMAGE_LOADED=false" >> "$GITHUB_ENV"
-          fi
 
       - name: Patch Dockerfiles
         run: |
@@ -72,25 +51,9 @@ jobs:
           grep -n 'libicu' "$JB" 2>/dev/null || true
 
       - name: Build Fuzzilli Docker image (JSC target)
-        if: env.IMAGE_LOADED != 'true'
         run: |
           cd Cloud/Docker
           ./build.sh jsc
-
-      - name: Save image to cache (always)
-        if: always()
-        run: |
-          set -euo pipefail
-          CACHE_DIR="$HOME/.cache/fuzzilli-build"
-          mkdir -p "$CACHE_DIR"
-          IMAGE=jsc_builder:latest
-          if docker image inspect "$IMAGE" >/dev/null 2>&1; then
-            echo "Saving image to cache..."
-            docker save -o "$CACHE_DIR/jsc_builder.tar" "$IMAGE"
-            ls -lah "$CACHE_DIR/jsc_builder.tar"
-          else
-            echo "Image $IMAGE không tồn tại, bỏ qua save."
-          fi
 
       - name: Locate binaries inside image
         id: locate
@@ -103,12 +66,19 @@ jobs:
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
 
           echo "==== Tìm jsc ===="
-          docker run --rm "$IMAGE" find /home/builder -type f -name 'jsc' 2>/dev/null | tee /tmp/jsc_paths.txt || true
+          docker run --rm "$IMAGE" find / -type f -name 'jsc' 2>/dev/null | tee /tmp/jsc_paths.txt || true
           echo "==== Tìm Fuzzilli ===="
-          docker run --rm "$IMAGE" find /home/builder -type f -name 'Fuzzilli' 2>/dev/null | tee /tmp/fuzzilli_paths.txt || true
+          docker run --rm "$IMAGE" find / -type f -name 'Fuzzilli' 2>/dev/null | tee /tmp/fuzzilli_paths.txt || true
 
-          JSC_PATH=$(head -n 1 /tmp/jsc_paths.txt || true)
-          FUZZ_PATH=$(head -n 1 /tmp/fuzzilli_paths.txt || true)
+          JSC_PATH=$(grep -E 'WebKitBuild|Fuzzilli' /tmp/jsc_paths.txt | head -n 1 || true)
+          if [ -z "$JSC_PATH" ]; then
+            JSC_PATH=$(head -n 1 /tmp/jsc_paths.txt || true)
+          fi
+
+          FUZZ_PATH=$(grep -E '\.build|release|Fuzzilli$' /tmp/fuzzilli_paths.txt | head -n 1 || true)
+          if [ -z "$FUZZ_PATH" ]; then
+            FUZZ_PATH=$(head -n 1 /tmp/fuzzilli_paths.txt || true)
+          fi
 
           if [ -z "$JSC_PATH" ]; then
             echo "ERROR: không tìm thấy jsc trong image"
@@ -174,22 +144,34 @@ jobs:
           echo "---- Nội dung out/ ----"
           find out -type f -exec ls -lah {} \;
 
+      - name: Zip output
+        run: |
+          cd out
+          zip -r ../jsc-fuzzilli-linux-x64.zip .
+          cd ..
+          ls -lah jsc-fuzzilli-linux-x64.zip
+
       - name: Verify REPRL symbols
         run: |
           echo "==== REPRL check ===="
           strings ./out/jsc | grep -i -E 'fuzzilli|reprl' | head -n 20 \
             || echo "WARN: no reprl symbols found"
-          echo "==== ldd trên runner ===="
-          LD_LIBRARY_PATH="$PWD/out/lib:$PWD/out/lib/swift:$PWD/out/lib/swift-linux" \
-            ldd ./out/jsc | head -n 30 || true
-          LD_LIBRARY_PATH="$PWD/out/lib:$PWD/out/lib/swift:$PWD/out/lib/swift-linux" \
-            ldd ./out/FuzzilliCli | head -n 30 || true
 
-      - name: Upload artifacts
+      - name: Upload artifact (30 days)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jsc-fuzzilli-binaries
-          path: out/
+          path: jsc-fuzzilli-linux-x64.zip
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Create Release (permanent)
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: jsc-fuzzilli-${{ github.run_number }}
+          name: JSC + Fuzzilli build ${{ github.run_number }}
+          files: jsc-fuzzilli-linux-x64.zip
+          draft: false
+          prerelease: false
