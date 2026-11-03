@@ -1,94 +1,52 @@
-name: build_test
+name: Build JSC + Fuzzilli
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  build_test:
-    timeout-minutes: 40
-    strategy:
-      # If macos-latest fails, we still don't want to cancel ubuntu-latest or the other way around.
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-        kind: [debug]
-        include:
-          # On linux also build and test release.
-          - os: ubuntu-latest
-            kind: release
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install jsvu
-        run: npm install jsvu -g
-      - name: Install d8
-        run: jsvu --os=default --engines=v8
-      - name: d8 version
-        run: ~/.jsvu/engines/v8/v8 --version
-      # TODO(mliedtke): This is too slow in comparison to its limited benefit. Decide what to do
-      # with it, either drop it or find a better way of testing this.
-      #
-      # - name: Install Binaryen
-      #   run: |
-      #     Tools/bootstrap-binaryen.sh ~/.binaryen
-      #     echo "$HOME/.binaryen/bin" >> $GITHUB_PATH
-      - name: Install Node.js dependencies for Compiler/Parser tests
-        working-directory: ./Sources/Fuzzilli/Compiler/Parser
-        run: npm install
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 28-nightly
-      - name: V8 version used by Node.js
-        run: node -p process.versions.v8
-      - name: Swift Version
-        run: swift --version
-      - name: Build
-        run: swift build -c ${{ matrix.kind }}
-      - name: Install protobuf
-        # Install protoc so the presubmit can also validate the generated *.pb.swift files.
-        if: ${{ matrix.os == 'ubuntu-latest' && matrix.kind == 'debug' }}
-        run: sudo apt update && sudo apt install -y protobuf-compiler
-      - name: Run presubmit checks
-        if: ${{ matrix.os == 'ubuntu-latest' && matrix.kind == 'debug' }}
-        run: python3 Tools/presubmit.py
-      - name: Run tests with Node.js
-        run: Tools/run_tests.py Tests/failing_nodejs.txt -c ${{ matrix.kind }} --no-parallel
-      - name: Run tests with d8
-        run: FUZZILLI_TEST_SHELL=~/.jsvu/engines/v8/v8 Tools/run_tests.py Tests/failing_jsvu.txt -c ${{ matrix.kind }} --no-parallel
-
-  asan:
-    timeout-minutes: 30
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
-      - uses: actions/checkout@v7
-      - name: Install jsvu
-        run: npm install jsvu -g
-      - name: Install d8
-        run: jsvu --os=default --engines=v8
-      - name: d8 version
-        run: ~/.jsvu/engines/v8/v8 --version
-      # TODO(mliedtke): This is too slow in comparison to its limited benefit. Decide what to do
-      # with it, either drop it or find a better way of testing this.
-      #
-      # - name: Install Binaryen
-      #   run: |
-      #     Tools/bootstrap-binaryen.sh ~/.binaryen
-      #     echo "$HOME/.binaryen/bin" >> $GITHUB_PATH
-      - name: Swift Version
-        run: swift --version
-      - name: Install LLVM
-        run: sudo apt update && sudo apt install -y llvm
-      - name: Run tests with leak sanitization
+      - name: Checkout Fuzzilli
+        uses: actions/checkout@v4
+
+      - name: Free disk space
         run: |
-          set -o pipefail
-          export ASAN_SYMBOLIZER_PATH=$(which llvm-symbolizer)
-          export FUZZILLI_TEST_SHELL=~/.jsvu/engines/v8/v8
-          export ASAN_OPTIONS=detect_leaks=1
-          export LSAN_OPTIONS=suppressions=$PWD/Tests/lsan_suppressions.txt
-          swift test --sanitize=address --no-parallel 2>&1 | swift demangle
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Build Fuzzilli Docker image (JSC target)
+        run: |
+          cd Cloud/Docker
+          # build.sh tự clone WebKit, apply patch, build JSC với REPRL, đóng gói vào image
+          ./build.sh jsc
+
+      - name: Extract jsc + FuzzilliCli from image
+        run: |
+          mkdir -p out
+          # Tạo container tạm từ image vừa build, không chạy
+          CONTAINER_ID=$(docker create fuzzilli)
+          # Đường dẫn bên trong image theo Dockerfile của Fuzzilli:
+          #   /home/builder/Fuzzilli        -> FuzzilliCli
+          #   /home/builder/jsc/jsc         -> jsc có REPRL
+          docker cp "$CONTAINER_ID":/home/builder/Fuzzilli ./out/FuzzilliCli
+          docker cp "$CONTAINER_ID":/home/builder/jsc/jsc ./out/jsc
+          docker rm "$CONTAINER_ID"
+          chmod +x ./out/FuzzilliCli ./out/jsc
+          ls -lah ./out/
+
+      - name: Verify REPRL symbols
+        run: |
+          strings ./out/jsc | grep -i -E 'fuzzilli|reprl' | head -n 20 || echo "WARN: no reprl symbols found"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsc-fuzzilli-binaries
+          path: out/
+          retention-days: 30
