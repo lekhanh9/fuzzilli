@@ -1,4 +1,4 @@
-name: Build JSC + Fuzzilli (Ultimate Nightly Noble)
+name: Build JSC + Fuzzilli (Ubuntu 24.04 Noble)
 
 on:
   workflow_dispatch:
@@ -23,50 +23,24 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Patch Dockerfiles and Build Script
+      - name: Patch Build Scripts and Dockerfiles
         run: |
           set -euo pipefail
           
-          # 1. Ghi đè build.sh hoàn toàn mới để tự động tìm jsc
-          cat << 'EOF' > Cloud/Docker/build.sh
-          #!/bin/bash
-          set -e
-          cd $(dirname $0)
-          FUZZILLI_ROOT=../../..
-          REV=$(cat $FUZZILLI_ROOT/Targets/JavaScriptCore/REVISION)
-          cp -R $FUZZILLI_ROOT/Targets/JavaScriptCore/Patches .
-          cp $FUZZILLI_ROOT/Targets/JavaScriptCore/fuzzbuild.sh .
-          docker build --build-arg rev=$REV -t jsc_builder .
+          # 1. Patch build.sh để tự động tìm file jsc thay vì dùng đường dẫn cũ FuzzBuild/Debug
+          sed -i 's|docker cp temp_container:/home/builder/webkit/FuzzBuild/Debug/bin/jsc out/jsc|JSC_PATH=$(docker run --rm jsc_builder find /home/builder/webkit -type f -name "jsc" 2>/dev/null \| head -n 1 \|\| true); docker cp temp_container:$JSC_PATH out/jsc \|\| true|' Cloud/Docker/build.sh
           
-          mkdir -p out
-          docker create --name temp_container jsc_builder
+          # 2. Đổi base image sang swift:noble (Swift mới nhất + Ubuntu 24.04)
+          sed -i 's/FROM swift:.*/FROM swift:noble/' Cloud/Docker/JSCBuilder/Dockerfile
+          sed -i 's/FROM swift:.*/FROM swift:noble/' Cloud/Docker/FuzzilliBuilder/Dockerfile
           
-          JSC_PATH=$(docker run --rm jsc_builder find /home/builder/webkit -type f -name 'jsc' 2>/dev/null | grep -E 'WebKitBuild|Fuzzilli' | head -n 1 || true)
-          if [ -z "$JSC_PATH" ]; then
-              JSC_PATH=$(docker run --rm jsc_builder find /home/builder/webkit -type f -name 'jsc' 2>/dev/null | head -n 1 || true)
-          fi
-          
-          if [ -z "$JSC_PATH" ]; then
-              echo "LỖI: Không tìm thấy jsc!"
-              exit 1
-          fi
-          
-          docker cp temp_container:"$JSC_PATH" out/jsc
-          docker rm temp_container
-          rm -r Patches
-          rm fuzzbuild.sh
-          EOF
-          chmod +x Cloud/Docker/build.sh
-
-          # 2. Ép dùng swift:nightly-noble (Swift 6.3+ trên Ubuntu 24.04)
-          sed -i 's/FROM swift:.*/FROM swift:nightly-noble/' Cloud/Docker/JSCBuilder/Dockerfile
-          sed -i 's/FROM swift:.*/FROM swift:nightly-noble/' Cloud/Docker/FuzzilliBuilder/Dockerfile
-          
-          # 3. Fix lỗi apt-get reinstall và bỏ swift test
+          # 3. Fix lỗi apt-get reinstall
           sed -i 's/apt-get reinstall libicu-dev/apt-get reinstall -y libicu-dev/' Cloud/Docker/JSCBuilder/Dockerfile
+          
+          # 4. Bỏ swift test
           sed -i 's/swift test && swift build -c release/swift build -c release/' Cloud/Docker/FuzzilliBuilder/Dockerfile
           
-          # 4. ENV non-interactive
+          # 5. Thêm ENV non-interactive
           for f in Cloud/Docker/*/Dockerfile Cloud/Docker/Dockerfile; do
             [ -f "$f" ] || continue
             if grep -q '^FROM' "$f" && ! grep -q 'DEBIAN_FRONTEND' "$f"; then
@@ -82,8 +56,8 @@ jobs:
       - name: Build FuzzilliCli
         run: |
           set -euo pipefail
-          # Build FuzzilliCli bằng swift:nightly-noble
-          docker run --rm -v "$PWD:/src" -w /src swift:nightly-noble \
+          # Build FuzzilliCli bằng image swift:noble
+          docker run --rm -v "$PWD:/src" -w /src swift:noble \
             bash -c "apt-get update && apt-get install -y libcurl4-openssl-dev libxml2-dev && swift build -c release"
           
           mkdir -p out
@@ -95,28 +69,28 @@ jobs:
           set -euo pipefail
           mkdir -p out/lib out/lib/swift
           
-          # 1. Copy jsc
-          cp Cloud/Docker/out/jsc ./out/jsc
+          # 1. Copy jsc từ thư mục out của build.sh
+          if [ -f "Cloud/Docker/out/jsc" ]; then
+              cp "Cloud/Docker/out/jsc" ./out/jsc
+          else
+              # Dự phòng nếu build.sh không copy được
+              docker create --name temp_jsc jsc_builder:latest
+              JSC_PATH=$(docker run --rm jsc_builder:latest find /home/builder/webkit -type f -name 'jsc' 2>/dev/null | head -n 1 || true)
+              docker cp temp_jsc:"$JSC_PATH" ./out/jsc
+              docker rm temp_jsc
+          fi
           chmod +x ./out/jsc
 
-          # 2. Copy thư viện .so từ WebKit và ICU
+          # 2. Copy thư viện ICU 74 (bản của Ubuntu 24.04) và libatomic
           docker create --name temp_jsc jsc_builder:latest
-          
-          docker cp temp_jsc:/home/builder/webkit/WebKitBuild ./out/tmp_wk 2>/dev/null || true
-          if [ -d "./out/tmp_wk" ]; then
-              find ./out/tmp_wk -name '*.so*' -exec cp -a {} ./out/lib/ \;
-              rm -rf ./out/tmp_wk
-          fi
-          
-          # Copy các thư viện ICU 74 và atomic phòng hờ (bản của Ubuntu 24.04)
-          docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libatomic.so.1 ./out/lib/ 2>/dev/null || true
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicuuc.so.74 ./out/lib/ 2>/dev/null || true
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicudata.so.74 ./out/lib/ 2>/dev/null || true
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicui18n.so.74 ./out/lib/ 2>/dev/null || true
+          docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libatomic.so.1 ./out/lib/ 2>/dev/null || true
           docker rm temp_jsc
 
           # 3. Copy Swift runtime cho FuzzilliCli
-          docker create --name temp_swift swift:nightly-noble
+          docker create --name temp_swift swift:noble
           docker cp temp_swift:/usr/lib/swift/linux ./out/lib/swift-linux
           docker rm temp_swift
 
