@@ -1,15 +1,32 @@
-name: Build JSC + Fuzzilli (Ubuntu 24.04 Noble)
+name: JSC Toolchain (Build & Fuzz)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+    inputs:
+      action:
+        description: 'Chọn hành động (Build hoặc Fuzz)'
+        required: true
+        default: 'fuzz'
+        type: choice
+        options:
+          - build
+          - fuzz
+      fuzz_duration:
+        description: 'Thời gian chạy Fuzz (nếu chọn fuzz)'
+        required: false
+        default: '3h'
+        type: string
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
+  # ==========================================
+  # JOB 1: BUILD JSC (Chỉ chạy khi chọn 'build')
+  # ==========================================
   build:
+    if: github.event.inputs.action == 'build'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -23,24 +40,44 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Patch Build Scripts and Dockerfiles
+      - name: Patch Dockerfiles and Build Script
         run: |
           set -euo pipefail
+          cat << 'EOF' > Cloud/Docker/build.sh
+          #!/bin/bash
+          set -e
+          cd $(dirname $0)
+          FUZZILLI_ROOT=../../..
+          REV=$(cat $FUZZILLI_ROOT/Targets/JavaScriptCore/REVISION)
+          cp -R $FUZZILLI_ROOT/Targets/JavaScriptCore/Patches .
+          cp $FUZZILLI_ROOT/Targets/JavaScriptCore/fuzzbuild.sh .
+          docker build --build-arg rev=$REV -t jsc_builder .
           
-          # 1. Patch build.sh để tự động tìm file jsc thay vì dùng đường dẫn cũ FuzzBuild/Debug
-          sed -i 's|docker cp temp_container:/home/builder/webkit/FuzzBuild/Debug/bin/jsc out/jsc|JSC_PATH=$(docker run --rm jsc_builder find /home/builder/webkit -type f -name "jsc" 2>/dev/null \| head -n 1 \|\| true); docker cp temp_container:$JSC_PATH out/jsc \|\| true|' Cloud/Docker/build.sh
+          mkdir -p out
+          docker create --name temp_container jsc_builder
           
-          # 2. Đổi base image sang swift:noble (Swift mới nhất + Ubuntu 24.04)
-          sed -i 's/FROM swift:.*/FROM swift:noble/' Cloud/Docker/JSCBuilder/Dockerfile
-          sed -i 's/FROM swift:.*/FROM swift:noble/' Cloud/Docker/FuzzilliBuilder/Dockerfile
+          JSC_PATH=$(docker run --rm jsc_builder find /home/builder/webkit -type f -name 'jsc' 2>/dev/null | grep -E 'WebKitBuild|Fuzzilli' | head -n 1 || true)
+          if [ -z "$JSC_PATH" ]; then
+              JSC_PATH=$(docker run --rm jsc_builder find /home/builder/webkit -type f -name 'jsc' 2>/dev/null | head -n 1 || true)
+          fi
           
-          # 3. Fix lỗi apt-get reinstall
+          if [ -z "$JSC_PATH" ]; then
+              echo "LỖI: Không tìm thấy jsc!"
+              exit 1
+          fi
+          
+          docker cp temp_container:"$JSC_PATH" out/jsc
+          docker rm temp_container
+          rm -r Patches
+          rm fuzzbuild.sh
+          EOF
+          chmod +x Cloud/Docker/build.sh
+
+          sed -i 's/FROM swift:.*/FROM swift:nightly-noble/' Cloud/Docker/JSCBuilder/Dockerfile
+          sed -i 's/FROM swift:.*/FROM swift:nightly-noble/' Cloud/Docker/FuzzilliBuilder/Dockerfile
           sed -i 's/apt-get reinstall libicu-dev/apt-get reinstall -y libicu-dev/' Cloud/Docker/JSCBuilder/Dockerfile
-          
-          # 4. Bỏ swift test
           sed -i 's/swift test && swift build -c release/swift build -c release/' Cloud/Docker/FuzzilliBuilder/Dockerfile
           
-          # 5. Thêm ENV non-interactive
           for f in Cloud/Docker/*/Dockerfile Cloud/Docker/Dockerfile; do
             [ -f "$f" ] || continue
             if grep -q '^FROM' "$f" && ! grep -q 'DEBIAN_FRONTEND' "$f"; then
@@ -56,10 +93,8 @@ jobs:
       - name: Build FuzzilliCli
         run: |
           set -euo pipefail
-          # Build FuzzilliCli bằng image swift:noble
-          docker run --rm -v "$PWD:/src" -w /src swift:noble \
+          docker run --rm -v "$PWD:/src" -w /src swift:nightly-noble \
             bash -c "apt-get update && apt-get install -y libcurl4-openssl-dev libxml2-dev && swift build -c release"
-          
           mkdir -p out
           cp .build/release/FuzzilliCli ./out/FuzzilliCli
           chmod +x ./out/FuzzilliCli
@@ -68,34 +103,25 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out/lib out/lib/swift
-          
-          # 1. Copy jsc từ thư mục out của build.sh
-          if [ -f "Cloud/Docker/out/jsc" ]; then
-              cp "Cloud/Docker/out/jsc" ./out/jsc
-          else
-              # Dự phòng nếu build.sh không copy được
-              docker create --name temp_jsc jsc_builder:latest
-              JSC_PATH=$(docker run --rm jsc_builder:latest find /home/builder/webkit -type f -name 'jsc' 2>/dev/null | head -n 1 || true)
-              docker cp temp_jsc:"$JSC_PATH" ./out/jsc
-              docker rm temp_jsc
-          fi
+          cp Cloud/Docker/out/jsc ./out/jsc
           chmod +x ./out/jsc
 
-          # 2. Copy thư viện ICU 74 (bản của Ubuntu 24.04) và libatomic
           docker create --name temp_jsc jsc_builder:latest
+          docker cp temp_jsc:/home/builder/webkit/WebKitBuild ./out/tmp_wk 2>/dev/null || true
+          if [ -d "./out/tmp_wk" ]; then
+              find ./out/tmp_wk -name '*.so*' -exec cp -a {} ./out/lib/ \;
+              rm -rf ./out/tmp_wk
+          fi
+          
+          docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libatomic.so.1 ./out/lib/ 2>/dev/null || true
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicuuc.so.74 ./out/lib/ 2>/dev/null || true
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicudata.so.74 ./out/lib/ 2>/dev/null || true
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicui18n.so.74 ./out/lib/ 2>/dev/null || true
-          docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libatomic.so.1 ./out/lib/ 2>/dev/null || true
           docker rm temp_jsc
 
-          # 3. Copy Swift runtime cho FuzzilliCli
-          docker create --name temp_swift swift:noble
+          docker create --name temp_swift swift:nightly-noble
           docker cp temp_swift:/usr/lib/swift/linux ./out/lib/swift-linux
           docker rm temp_swift
-
-          echo "---- Nội dung out/ ----"
-          ls -lah out/ out/lib/
 
       - name: Zip Output
         run: |
@@ -109,3 +135,80 @@ jobs:
           name: jsc-fuzzilli-binaries
           path: jsc-fuzzilli-linux-x64.zip
           retention-days: 30
+
+  # ==========================================
+  # JOB 2: FUZZ (Chỉ chạy khi chọn 'fuzz')
+  # ==========================================
+  fuzz:
+    if: github.event.inputs.action == 'fuzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+          df -h /
+
+      - name: Download Pre-built Binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Tự động tải file zip chứa jsc và FuzzilliCli từ lần build trước
+          gh run download --name jsc-fuzzilli-binaries --dir .
+          mkdir -p fuzz_env
+          unzip -o jsc-fuzzilli-binaries.zip -d fuzz_env
+          cd fuzz_env
+          chmod +x ./jsc ./FuzzilliCli
+
+      - name: Restore Fuzz Data from Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz_env/fuzz_data
+          key: fuzz-data-${{ github.run_id }}
+          restore-keys: |
+            fuzz-data-
+
+      - name: Run Fuzzer
+        run: |
+          cd fuzz_env
+          export LD_LIBRARY_PATH="$PWD/lib:$PWD/lib/swift-linux"
+          
+          mkdir -p fuzz_data/corpus
+          # Nếu có seed AI thì ném vào
+          if [ -f "../seeds/ai_complex_types.js" ]; then
+            cp ../seeds/ai_complex_types.js fuzz_data/corpus/
+          fi
+          
+          echo "🔥 Bắt đầu Fuzz trong ${{ github.event.inputs.fuzz_duration }}..."
+          
+          ./FuzzilliCli --profile=jsc \
+                        --jobs=2 \
+                        --storagePath=./fuzz_data \
+                        --resume \
+                        --timeout=400 \
+                        --engine=hybrid \
+                        --fixedMinimizationTimeout \
+                        --maxRuntime=${{ github.event.inputs.fuzz_duration }} \
+                        --additionalArguments="--useExplicitResourceManagement=true,--useTemporal=true,--useZombieMode=true,--useShadowRealm=true" \
+                        ./jsc
+        continue-on-error: true
+
+      - name: Save Fuzz Data to Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz_env/fuzz_data
+          key: fuzz-data-${{ github.run_id }}
+
+      - name: Upload Crashes (Nếu có)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz_env/fuzz_data/crashes/
+          retention-days: 7
