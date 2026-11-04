@@ -1,0 +1,88 @@
+name: Run Fuzzilli with Cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      fuzz_duration:
+        description: 'Thời gian chạy Fuzz (ví dụ: 1h, 3h, 5h)'
+        required: true
+        default: '3h'
+        type: string
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Download Pre-built Binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh run download --name jsc-fuzzilli-binaries --dir .
+          mkdir -p fuzz_env
+          unzip -o jsc-fuzzilli-binaries.zip -d fuzz_env
+          cd fuzz_env
+          chmod +x ./jsc ./FuzzilliCli
+
+      # --- TÍNH NĂNG MỚI: RESTORE CACHE ---
+      - name: Restore Fuzz Data from Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz_env/fuzz_data
+          key: fuzz-data-${{ github.run_id }}
+          restore-keys: |
+            fuzz-data-
+
+      - name: Prepare Corpus & Run Fuzzer
+        run: |
+          cd fuzz_env
+          export LD_LIBRARY_PATH="$PWD/lib:$PWD/lib/swift-linux"
+          
+          # Nếu cache mới tinh (lần đầu chạy), tạo thư mục
+          mkdir -p fuzz_data/corpus
+          
+          # Ném seed AI vào nếu có
+          if [ -f "../seeds/ai_complex_types.js" ]; then
+            cp ../seeds/ai_complex_types.js fuzz_data/corpus/
+          fi
+          
+          echo "🔥 Bắt đầu Fuzz trong ${{ github.event.inputs.fuzz_duration }}..."
+          
+          # Thêm cờ --resume để nó nhận diện cache cũ và chạy tiếp
+          ./FuzzilliCli --profile=jsc \
+                        --jobs=2 \
+                        --storagePath=./fuzz_data \
+                        --resume \
+                        --timeout=400 \
+                        --engine=hybrid \
+                        --fixedMinimizationTimeout \
+                        --maxRuntime=${{ github.event.inputs.fuzz_duration }} \
+                        --additionalArguments="--useExplicitResourceManagement=true,--useTemporal=true,--useZombieMode=true,--useShadowRealm=true" \
+                        ./jsc
+        continue-on-error: true
+
+      # --- TÍNH NĂNG MỚI: SAVE CACHE ---
+      - name: Save Fuzz Data to Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz_env/fuzz_data
+          key: fuzz-data-${{ github.run_id }}
+
+      - name: Upload Crashes (Nếu có)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz_env/fuzz_data/crashes/
+          retention-days: 7
