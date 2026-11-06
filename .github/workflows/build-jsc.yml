@@ -23,66 +23,56 @@ jobs:
           sudo apt-get clean
           df -h /
 
-      - name: Patch Dockerfiles and Build Script
+      - name: Patch Dockerfiles
         run: |
           set -euo pipefail
           
-          # 1. Ghi đè build.sh (Fix lỗi đường dẫn thành ../../ và ép dùng branch 7615)
-          cat << 'EOF' > Cloud/Docker/build.sh
-          #!/bin/bash
-          set -e
-          cd "$(dirname "$0")"
-          
-          # Lùi 2 cấp từ Cloud/Docker để về gốc repo Fuzzilli
-          FUZZILLI_ROOT="../../"
-          
-          # Ép build đúng nhánh của iOS 16.7
-          REV="safari-7615.3.12.110-branch"
-          
-          cp -R $FUZZILLI_ROOT/Targets/JavaScriptCore/Patches .
-          cp $FUZZILLI_ROOT/Targets/JavaScriptCore/fuzzbuild.sh .
-          
-          docker build --build-arg rev=$REV -t jsc_builder .
-          
-          mkdir -p out
-          docker create --name temp_container jsc_builder
-          
-          JSC_PATH=$(docker run --rm jsc_builder find /home/builder/webkit -type f -name 'jsc' 2>/dev/null | head -n 1)
-          if [ -z "$JSC_PATH" ]; then
-              echo "LỖI: Không tìm thấy jsc!"
-              exit 1
-          fi
-          
-          docker cp temp_container:"$JSC_PATH" out/jsc
-          docker rm temp_container
-          rm -r Patches
-          rm fuzzbuild.sh
-          EOF
-          chmod +x Cloud/Docker/build.sh
-
-          # 2. Ép dùng swift:nightly-noble
+          # Ép dùng swift:nightly-noble
           sed -i 's/FROM swift:.*/FROM swift:nightly-noble/' Cloud/Docker/JSCBuilder/Dockerfile
           sed -i 's/FROM swift:.*/FROM swift:nightly-noble/' Cloud/Docker/FuzzilliBuilder/Dockerfile
           
-          # 3. Sửa JSCBuilder Dockerfile để clone đúng branch 7615
+          # Sửa JSCBuilder Dockerfile để clone đúng branch 7615
           sed -i 's|git clone --filter=blob:none https://github.com/WebKit/WebKit.git /home/builder/webkit|git clone --branch safari-7615.3.12.110-branch --depth 1 https://github.com/WebKit/WebKit.git /home/builder/webkit|' Cloud/Docker/JSCBuilder/Dockerfile
           
           # Fix lỗi apt-get reinstall và bỏ swift test
           sed -i 's/apt-get reinstall libicu-dev/apt-get reinstall -y libicu-dev/' Cloud/Docker/JSCBuilder/Dockerfile
           sed -i 's/swift test && swift build -c release/swift build -c release/' Cloud/Docker/FuzzilliBuilder/Dockerfile
           
-          # 4. ENV non-interactive
-          for f in Cloud/Docker/*/Dockerfile Cloud/Docker/Dockerfile; do
+          # ENV non-interactive
+          for f in Cloud/Docker/*/Dockerfile; do
             [ -f "$f" ] || continue
             if grep -q '^FROM' "$f" && ! grep -q 'DEBIAN_FRONTEND' "$f"; then
               sed -i '/^FROM/a ENV DEBIAN_FRONTEND=noninteractive' "$f"
             fi
           done
 
-      - name: Build JSC
+      - name: Build JSC Image directly
         run: |
-          cd Cloud/Docker
-          ./build.sh jsc
+          set -euo pipefail
+          cd Cloud/Docker/JSCBuilder
+          
+          # Copy patches và script build
+          cp -R ../../../Targets/JavaScriptCore/Patches .
+          cp ../../../Targets/JavaScriptCore/fuzzbuild.sh .
+          
+          # Build image
+          docker build --build-arg rev=safari-7615.3.12.110-branch -t jsc_builder .
+          
+          # Trích xuất jsc
+          docker create --name temp_container jsc_builder
+          JSC_PATH=$(docker run --rm jsc_builder find /home/builder/webkit -type f -name 'jsc' 2>/dev/null | head -n 1)
+          
+          if [ -z "$JSC_PATH" ]; then
+              echo "LỖI: Không tìm thấy jsc!"
+              exit 1
+          fi
+          
+          mkdir -p out
+          docker cp temp_container:"$JSC_PATH" out/jsc
+          docker rm temp_container
+          
+          # Dọn dẹp
+          rm -rf Patches fuzzbuild.sh
 
       - name: Build FuzzilliCli
         run: |
@@ -93,13 +83,16 @@ jobs:
           cp .build/release/FuzzilliCli ./out/FuzzilliCli
           chmod +x ./out/FuzzilliCli
 
-      - name: Extract JSC and Libraries
+      - name: Extract Libraries
         run: |
           set -euo pipefail
           mkdir -p out/lib out/lib/swift
-          cp Cloud/Docker/out/jsc ./out/jsc
+          
+          # Copy jsc
+          cp Cloud/Docker/JSCBuilder/out/jsc ./out/jsc
           chmod +x ./out/jsc
 
+          # Lấy thư viện ICU và các libs khác từ image jsc_builder
           docker create --name temp_jsc jsc_builder:latest
           docker cp temp_jsc:/home/builder/webkit/WebKitBuild ./out/tmp_wk 2>/dev/null || true
           if [ -d "./out/tmp_wk" ]; then
@@ -113,6 +106,7 @@ jobs:
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicui18n.so.74 ./out/lib/ 2>/dev/null || true
           docker rm temp_jsc
 
+          # Copy Swift runtime cho FuzzilliCli
           docker create --name temp_swift swift:nightly-noble
           docker cp temp_swift:/usr/lib/swift/linux ./out/lib/swift-linux
           docker rm temp_swift
