@@ -27,18 +27,18 @@ jobs:
         run: |
           set -euo pipefail
           
-          # Ép dùng swift:nightly-noble
-          sed -i 's/FROM swift:.*/FROM swift:nightly-noble/' Cloud/Docker/JSCBuilder/Dockerfile
-          sed -i 's/FROM swift:.*/FROM swift:nightly-noble/' Cloud/Docker/FuzzilliBuilder/Dockerfile
+          # 1. Ép dùng swift:latest (có Swift 6.4.2)
+          sed -i 's/FROM swift:.*/FROM swift:latest/' Cloud/Docker/JSCBuilder/Dockerfile
+          sed -i 's/FROM swift:.*/FROM swift:latest/' Cloud/Docker/FuzzilliBuilder/Dockerfile
           
-          # Sửa JSCBuilder Dockerfile để clone đúng branch 7615
+          # 2. Sửa JSCBuilder Dockerfile để clone đúng branch 7615 (iOS 16.7)
           sed -i 's|git clone --filter=blob:none https://github.com/WebKit/WebKit.git /home/builder/webkit|git clone --branch safari-7615.3.12.110-branch --depth 1 https://github.com/WebKit/WebKit.git /home/builder/webkit|' Cloud/Docker/JSCBuilder/Dockerfile
           
-          # Fix lỗi apt-get reinstall và bỏ swift test
+          # 3. Fix lỗi apt-get reinstall và bỏ swift test
           sed -i 's/apt-get reinstall libicu-dev/apt-get reinstall -y libicu-dev/' Cloud/Docker/JSCBuilder/Dockerfile
           sed -i 's/swift test && swift build -c release/swift build -c release/' Cloud/Docker/FuzzilliBuilder/Dockerfile
           
-          # ENV non-interactive
+          # 4. ENV non-interactive
           for f in Cloud/Docker/*/Dockerfile; do
             [ -f "$f" ] || continue
             if grep -q '^FROM' "$f" && ! grep -q 'DEBIAN_FRONTEND' "$f"; then
@@ -51,11 +51,11 @@ jobs:
           set -euo pipefail
           cd Cloud/Docker/JSCBuilder
           
-          # Copy patches và script build
+          # Copy patches và script build từ repo Fuzzilli
           cp -R ../../../Targets/JavaScriptCore/Patches .
           cp ../../../Targets/JavaScriptCore/fuzzbuild.sh .
           
-          # Build image
+          # Build image (truyền branch name vào cho chắc, dù Dockerfile đã hardcode)
           docker build --build-arg rev=safari-7615.3.12.110-branch -t jsc_builder .
           
           # Trích xuất jsc
@@ -77,7 +77,7 @@ jobs:
       - name: Build FuzzilliCli
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD:/src" -w /src swift:nightly-noble \
+          docker run --rm -v "$PWD:/src" -w /src swift:latest \
             bash -c "apt-get update && apt-get install -y libcurl4-openssl-dev libxml2-dev && swift build -c release"
           mkdir -p out
           cp .build/release/FuzzilliCli ./out/FuzzilliCli
@@ -88,11 +88,11 @@ jobs:
           set -euo pipefail
           mkdir -p out/lib out/lib/swift
           
-          # Copy jsc
+          # 1. Copy jsc
           cp Cloud/Docker/JSCBuilder/out/jsc ./out/jsc
           chmod +x ./out/jsc
 
-          # Lấy thư viện ICU và các libs khác từ image jsc_builder
+          # 2. Lấy thư viện động (ICU, JSC) từ image jsc_builder
           docker create --name temp_jsc jsc_builder:latest
           docker cp temp_jsc:/home/builder/webkit/WebKitBuild ./out/tmp_wk 2>/dev/null || true
           if [ -d "./out/tmp_wk" ]; then
@@ -106,8 +106,8 @@ jobs:
           docker cp temp_jsc:/usr/lib/x86_64-linux-gnu/libicui18n.so.74 ./out/lib/ 2>/dev/null || true
           docker rm temp_jsc
 
-          # Copy Swift runtime cho FuzzilliCli
-          docker create --name temp_swift swift:nightly-noble
+          # 3. Copy Swift runtime cho FuzzilliCli
+          docker create --name temp_swift swift:latest
           docker cp temp_swift:/usr/lib/swift/linux ./out/lib/swift-linux
           docker rm temp_swift
 
